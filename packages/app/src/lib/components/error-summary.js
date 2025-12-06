@@ -31,12 +31,22 @@ const handleErrorClick = (result) => {
   // Directly set new highlights without clearing first
   // This prevents the double-update that causes scroll jumping
 
-  // For shapes graph, use resultPath (the property that violated the constraint)
-  if (result.resultPath) {
-    const resultPathValue = result.resultPath?.id?.value || result.resultPath?.value;
+  // For shapes graph, use both sourceShape (the shape context) and resultPath (the property to highlight)
+  // This allows us to highlight the specific property within the shape definition
+  const sourceShapeValue = result.sourceShape?.id?.value || result.sourceShape?.value;
+  const resultPathValue = result.resultPath?.id?.value || result.resultPath?.value;
+
+  if (sourceShapeValue && resultPathValue) {
+    // We have both shape and property - highlight property within shape context
+    store.dispatch.highlight.highlightShapesNode({ sourceShape: sourceShapeValue, resultPath: resultPathValue });
+  } else if (sourceShapeValue) {
+    // Only shape available
+    store.dispatch.highlight.highlightShapesNode(sourceShapeValue);
+  } else if (resultPathValue) {
+    // Fallback to resultPath if sourceShape is not available
     store.dispatch.highlight.highlightShapesNode(resultPathValue);
   } else if (result.sourceConstraintComponent) {
-    // Fallback to constraint component
+    // Final fallback to constraint component
     const constraintValue = result.sourceConstraintComponent?.id?.value || result.sourceConstraintComponent?.value;
     store.dispatch.highlight.highlightShapesNode(constraintValue);
   }
@@ -44,7 +54,6 @@ const handleErrorClick = (result) => {
   // Highlight data graph node if focusNode exists
   if (result.focusNode) {
     const focusNodeValue = result.focusNode.value;
-    const resultPathValue = result.resultPath?.id?.value || result.resultPath?.value || null;
     store.dispatch.highlight.highlightDataNode({
       focusNode: focusNodeValue,
       resultPath: resultPathValue,

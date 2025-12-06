@@ -62,6 +62,7 @@ class GraphEditor extends connect(store, LitElement) {
       customPrefixes: { type: Object },
       highlightTerm: { type: String },
       highlightContext: { type: String },
+      highlightTimestamp: { type: Number }, // Timestamp to detect highlight requests
       quads: { type: Array },
     };
   }
@@ -73,11 +74,31 @@ class GraphEditor extends connect(store, LitElement) {
     await autoRefresh();
     editor.codeMirror.editor.setOption("autoRefresh", true);
     this._editor = editor.codeMirror.editor;
+
+    // Inject highlight styles directly into the CodeMirror wrapper
+    const cmWrapper = editor.codeMirror.shadowRoot?.querySelector('.CodeMirror') ||
+                      editor.shadowRoot?.querySelector('.CodeMirror') ||
+                      editor.querySelector('.CodeMirror');
+
+    if (cmWrapper) {
+      const style = document.createElement('style');
+      style.textContent = `
+        .cm-highlight {
+          background-color: yellow !important;
+          padding: 2px 0 !important;
+        }
+      `;
+      cmWrapper.appendChild(style);
+    } else {
+      console.warn('[GraphEditor] Could not find CodeMirror wrapper to inject styles for', this.model);
+    }
   }
 
   updated(changedProperties) {
     super.updated(changedProperties);
-    if ((changedProperties.has("highlightTerm") || changedProperties.has("highlightContext")) && this._editor) {
+
+    // Apply highlight when timestamp changes (indicates a new highlight request)
+    if (changedProperties.has("highlightTimestamp") && this._editor && this.highlightTimestamp) {
       this._applyHighlight();
     }
   }
@@ -95,11 +116,20 @@ class GraphEditor extends connect(store, LitElement) {
     const contextLineIndices = [];
 
     // Generate alternative forms of the context
+    const shrunkContext = shrink(contextTerm, this.customPrefixes) || shrink(contextTerm);
+    const localPart = contextTerm.split('/').pop().split('#').pop();
+
+    // Detect prefix from content for this namespace
+    const namespace = contextTerm.substring(0, Math.max(contextTerm.lastIndexOf('/'), contextTerm.lastIndexOf('#')) + 1);
+    const content = lines.join('\n');
+    const prefixMatch = content.match(new RegExp(`@prefix\\s+(\\w+):\\s+<${namespace.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}>`));
+    const detectedPrefix = prefixMatch ? prefixMatch[1] : null;
+
     const contextTermVariants = [
-      contextTerm, // Full IRI first
-      shrink(contextTerm, this.customPrefixes) || shrink(contextTerm), // Then prefixed
-      contextTerm.split('/').pop(), // Local part after last /
-      contextTerm.split('#').pop(), // Local part after #
+      `<${contextTerm}>`, // Full IRI in angle brackets
+      shrunkContext !== contextTerm ? shrunkContext : null, // Prefixed form from shrink
+      detectedPrefix ? `${detectedPrefix}:${localPart}` : null, // Detected prefix form
+      localPart !== contextTerm ? localPart : null, // Local part alone
     ].filter(Boolean).filter((v, i, arr) => arr.indexOf(v) === i);
 
     for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
@@ -315,6 +345,164 @@ class GraphEditor extends connect(store, LitElement) {
     return predicateStrings;
   }
 
+  _findAndHighlightShapePath(content, doc, searchTerm, contextTerm, lines) {
+    // Find sh:path statements with the searchTerm as the object value
+    // within the context of a specific shape (contextTerm)
+    const matches = [];
+    let contextLinePosition = null;
+
+    // First, find the shape definition (context)
+    const contextLineIndices = this._findContextLines(lines, contextTerm);
+
+    if (contextLineIndices.length === 0) {
+      return { matches, contextLinePosition: null };
+    }
+
+    // Store context line position for scrolling
+    if (contextLineIndices.length > 0) {
+      let charOffset = 0;
+      for (let i = 0; i < contextLineIndices[0]; i++) {
+        charOffset += lines[i].length + 1;
+      }
+      contextLinePosition = doc.posFromIndex(charOffset);
+    }
+
+    // Build set of lines to search within the shape context
+    const linesToSearch = this._buildLinesToSearch(lines, contextLineIndices);
+
+    // Generate search variants for the path value
+    const shrunkForm = shrink(searchTerm, this.customPrefixes) || shrink(searchTerm);
+
+    // Fallback: try common prefixes if shrink didn't work
+    const localPart = searchTerm.split('/').pop().split('#').pop();
+    let alternativeForms = [];
+    if ((!shrunkForm || shrunkForm === searchTerm || shrunkForm.trim() === '') && searchTerm.includes('schema.org')) {
+      alternativeForms = [`schema:${localPart}`, `sdo:${localPart}`];
+    }
+
+
+    const searchVariants = [
+      `sh:path <${searchTerm}>`,
+      shrunkForm && shrunkForm !== searchTerm && shrunkForm.trim() !== '' ? `sh:path ${shrunkForm}` : null,
+      ...alternativeForms.map(form => `sh:path ${form}`),
+      `<http://www.w3.org/ns/shacl#path> <${searchTerm}>`,
+      shrunkForm && shrunkForm !== searchTerm && shrunkForm.trim() !== '' ? `<http://www.w3.org/ns/shacl#path> ${shrunkForm}` : null,
+      ...alternativeForms.map(form => `<http://www.w3.org/ns/shacl#path> ${form}`),
+    ].filter(Boolean);
+
+
+    // Search within context lines
+    let charOffset = 0;
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+      const line = lines[lineIndex];
+
+      if (linesToSearch.has(lineIndex)) {
+        for (const variant of searchVariants) {
+          const foundIndex = line.indexOf(variant);
+          if (foundIndex !== -1) {
+            // Determine what part to highlight (the property value after sh:path)
+            // Variants look like: "sh:path <URI>" or "sh:path schema:publisher"
+            // We want to highlight the part AFTER "sh:path " or after the full SHACL predicate
+            let valueString;
+            let valueStart;
+
+            // Check which type of variant this is
+            if (variant.startsWith('sh:path ')) {
+              valueString = variant.substring('sh:path '.length);
+              valueStart = variant.indexOf(valueString);
+            } else if (variant.startsWith('<http://www.w3.org/ns/shacl#path> ')) {
+              valueString = variant.substring('<http://www.w3.org/ns/shacl#path> '.length);
+              valueStart = variant.indexOf(valueString);
+            } else {
+              console.warn('[_findAndHighlightShapePath] Unknown variant format:', variant);
+              continue;
+            }
+
+
+            if (valueStart === -1 || !valueString) {
+              console.warn('[_findAndHighlightShapePath] Could not find value in variant, skipping');
+              continue;
+            }
+
+            const globalIndex = charOffset + foundIndex + valueStart;
+            const from = doc.posFromIndex(globalIndex);
+            const to = doc.posFromIndex(globalIndex + valueString.length);
+
+
+            const marker = doc.markText(from, to, {
+              className: "cm-highlight",
+            });
+
+            this._highlightMarkers.push(marker);
+            matches.push(from);
+            break;
+          }
+        }
+      }
+
+      charOffset += line.length + 1; // +1 for newline
+    }
+
+
+    return { matches, contextLinePosition };
+  }
+
+  _findAndHighlightSubject(content, doc, searchTerm) {
+    // Find and highlight a subject (shape node) - it appears at the start of lines
+    const matches = [];
+    const lines = content.split('\n');
+
+    // Generate search variants for the subject
+    const shrunkForm = shrink(searchTerm, this.customPrefixes) || shrink(searchTerm);
+    const localPart = searchTerm.split('/').pop().split('#').pop();
+
+    // Try to detect the prefix from the content
+    // Look for @prefix declarations that match our namespace
+    const namespace = searchTerm.substring(0, searchTerm.lastIndexOf('#') + 1);
+    const prefixMatch = content.match(new RegExp(`@prefix\\s+(\\w+):\\s+<${namespace.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}>`));
+    const detectedPrefix = prefixMatch ? prefixMatch[1] : null;
+
+    const subjectVariants = [
+      `<${searchTerm}>`, // Full IRI in angle brackets
+      shrunkForm !== searchTerm ? shrunkForm : null, // Prefixed form from shrink
+      detectedPrefix ? `${detectedPrefix}:${localPart}` : null, // Detected prefix form
+      localPart !== searchTerm ? localPart : null, // Local part alone
+    ].filter(Boolean);
+
+
+    let charOffset = 0;
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+      const line = lines[lineIndex];
+      const trimmed = line.trim();
+
+      // Check if this line starts with one of our subject variants
+      for (const variant of subjectVariants) {
+        if (trimmed.startsWith(variant + ' ') ||
+            trimmed.startsWith(variant + '\t') ||
+            trimmed === variant) {
+
+          const foundIndex = line.indexOf(variant);
+          const globalIndex = charOffset + foundIndex;
+          const from = doc.posFromIndex(globalIndex);
+          const to = doc.posFromIndex(globalIndex + variant.length);
+
+
+          const marker = doc.markText(from, to, {
+            className: "cm-highlight",
+          });
+
+          this._highlightMarkers.push(marker);
+          matches.push(from);
+          break; // Only match once per line
+        }
+      }
+
+      charOffset += line.length + 1; // +1 for newline
+    }
+
+    return matches;
+  }
+
   _findAndHighlight(content, doc, searchTerm) {
     const matches = [];
 
@@ -375,7 +563,6 @@ class GraphEditor extends connect(store, LitElement) {
       const to = doc.posFromIndex(occurrence.index + occurrence.length);
 
       const marker = doc.markText(from, to, {
-        css: "background-color: yellow",
         className: "cm-highlight",
       });
 
@@ -441,7 +628,6 @@ class GraphEditor extends connect(store, LitElement) {
           const to = doc.posFromIndex(foundIndex + variant.length);
 
           const marker = doc.markText(from, to, {
-            css: "background-color: yellow",
             className: "cm-highlight",
           });
 
@@ -461,7 +647,18 @@ class GraphEditor extends connect(store, LitElement) {
     let contextLinePosition = null;
     const lines = content.split('\n');
 
-    // Get the actual predicate strings from RDF quads with subject filter (format-agnostic)
+
+    // For shapes graph, searchTerm is the sh:path value (object), not a predicate
+    // For data graph, searchTerm is a predicate
+    const isShapesGraph = this.model === 'shapesGraph';
+
+    if (isShapesGraph) {
+      // In shapes graph, we need to find sh:path statements with this value
+      // Look for patterns like: sh:path <searchTerm> or sh:path schema:publisher
+      return this._findAndHighlightShapePath(content, doc, searchTerm, contextTerm, lines);
+    }
+
+    // Data graph logic: Get the actual predicate strings from RDF quads with subject filter
     const predicateStrings = this._getPredicateStringsFromQuads(searchTerm, contextTerm);
 
     if (predicateStrings.size > 0) {
@@ -506,7 +703,6 @@ class GraphEditor extends connect(store, LitElement) {
                   const to = doc.posFromIndex(globalIndex + predicateString.length);
 
                   const marker = doc.markText(from, to, {
-                    css: "background-color: yellow",
                     className: "cm-highlight",
                   });
 
@@ -617,7 +813,6 @@ class GraphEditor extends connect(store, LitElement) {
               const to = doc.posFromIndex(globalIndex + searchVariant.length);
 
               const marker = doc.markText(from, to, {
-                css: "background-color: yellow",
                 className: "cm-highlight",
               });
 
@@ -654,7 +849,6 @@ class GraphEditor extends connect(store, LitElement) {
             const to = doc.posFromIndex(globalIndex + variant.length);
 
             const marker = doc.markText(from, to, {
-              css: "background-color: yellow",
               className: "cm-highlight",
             });
 
@@ -672,6 +866,7 @@ class GraphEditor extends connect(store, LitElement) {
   _applyHighlight() {
     this._clearHighlights();
 
+
     if (!this.highlightTerm || !this._editor) {
       return;
     }
@@ -681,10 +876,12 @@ class GraphEditor extends connect(store, LitElement) {
     const contextTerm = this.highlightContext;
     const content = doc.getValue();
 
-    // If we have a context (for data graph), find matches within context
+
+    // If we have a context (for data graph OR shapes graph), find matches within context
     if (contextTerm) {
       const result = this._findAndHighlightInContext(content, doc, searchTerm, contextTerm);
       const { matches, contextLinePosition } = result;
+
 
       // Scroll to show the first highlighted match (property)
       if (matches.length > 0) {
@@ -735,8 +932,12 @@ class GraphEditor extends connect(store, LitElement) {
         };
 
         // Perform scroll multiple times to ensure it sticks
-        setTimeout(performScroll, 50);
-        setTimeout(performScroll, 100);
+        setTimeout(() => {
+          performScroll();
+        }, 50);
+        setTimeout(() => {
+          performScroll();
+        }, 100);
         this._scrollLockTimeout = setTimeout(() => {
           performScroll();
           this._scrollLockTimeout = null;
@@ -744,35 +945,44 @@ class GraphEditor extends connect(store, LitElement) {
       }
     } else {
       // No context, highlight all occurrences (for shapes graph)
-      // Try to find the full IRI first
-      let matches = this._findAndHighlight(content, doc, searchTerm);
+      // This can be either a shape node (subject) or a predicate
+      let matches = [];
 
-      // If no matches found, try the prefixed version
+      // First, try to find as a subject (shape node) - look for it at the start of lines
+      matches = this._findAndHighlightSubject(content, doc, searchTerm);
+
+      // If not found as subject, try as predicate
       if (matches.length === 0) {
-        const prefixedTerm = shrink(searchTerm, this.customPrefixes) || shrink(searchTerm);
-        if (prefixedTerm && prefixedTerm !== searchTerm) {
-          matches = this._findAndHighlight(content, doc, prefixedTerm);
-        }
-      }
+        matches = this._findAndHighlight(content, doc, searchTerm);
 
-      // If still no matches with full prefixed format, try just the local part
-      if (matches.length === 0 && searchTerm.includes('/')) {
-        const localPart = searchTerm.split('/').pop();
-        if (localPart) {
-          matches = this._findAndHighlight(content, doc, localPart);
+        // If no matches found, try the prefixed version
+        if (matches.length === 0) {
+          const prefixedTerm = shrink(searchTerm, this.customPrefixes) || shrink(searchTerm);
+          if (prefixedTerm && prefixedTerm !== searchTerm) {
+            matches = this._findAndHighlight(content, doc, prefixedTerm);
+          }
         }
-      }
 
-      // If still no matches with full prefixed format, try just the local part after #
-      if (matches.length === 0 && searchTerm.includes('#')) {
-        const localPart = searchTerm.split('#').pop();
-        if (localPart) {
-          matches = this._findAndHighlight(content, doc, localPart);
+        // If still no matches with full prefixed format, try just the local part
+        if (matches.length === 0 && searchTerm.includes('/')) {
+          const localPart = searchTerm.split('/').pop();
+          if (localPart) {
+            matches = this._findAndHighlight(content, doc, localPart);
+          }
+        }
+
+        // If still no matches with full prefixed format, try just the local part after #
+        if (matches.length === 0 && searchTerm.includes('#')) {
+          const localPart = searchTerm.split('#').pop();
+          if (localPart) {
+            matches = this._findAndHighlight(content, doc, localPart);
+          }
         }
       }
 
       // If we found at least one match, scroll to the first one
       if (matches.length > 0) {
+
         // Cancel any pending scroll lock from previous clicks
         if (this._scrollLockTimeout) {
           clearTimeout(this._scrollLockTimeout);
@@ -782,10 +992,44 @@ class GraphEditor extends connect(store, LitElement) {
         // Store the target position to maintain it across updates
         this._targetScrollPosition = matches[0];
 
-        // Scroll the highlighted line into view with margin
-        this._editor.scrollIntoView({ from: matches[0], to: matches[0] }, 200);
-        // Also set cursor position to make it more visible
-        this._editor.setCursor(matches[0]);
+        // First, set cursor WITHOUT auto-scrolling
+        this._editor.setCursor(matches[0], null, { scroll: false });
+
+        // Scroll to show the target line below the sticky header
+        // Use a small delay to ensure CodeMirror has rendered
+        const performScroll = () => {
+          // Get the line element's position in the page
+          const coords = this._editor.charCoords(matches[0], "page");
+          const editorWrapper = this._editor.getWrapperElement();
+          const editorRect = editorWrapper.getBoundingClientRect();
+          const container = this; // The graph-editor custom element (this component)
+
+          const headerHeight = 70; // Height of sticky header
+          const marginBelowHeader = 20; // Extra margin below header
+
+          // Calculate where the line is relative to the editor wrapper
+          const lineTopInEditor = coords.top - editorRect.top;
+
+          // Calculate target scroll: position line just below the header
+          const targetScrollTop = lineTopInEditor - headerHeight - marginBelowHeader;
+
+          // Scroll the container (this component) not CodeMirror
+          if (targetScrollTop < 0) {
+            // Line is near top, scroll to top
+            container.scrollTop = 0;
+          } else {
+            // Scroll container to show line below header
+            container.scrollTop = targetScrollTop;
+          }
+        };
+
+        // Perform scroll multiple times to ensure it sticks
+        setTimeout(performScroll, 50);
+        setTimeout(performScroll, 100);
+        this._scrollLockTimeout = setTimeout(() => {
+          performScroll();
+          this._scrollLockTimeout = null;
+        }, 200);
       }
     }
   }
@@ -824,7 +1068,16 @@ class GraphEditor extends connect(store, LitElement) {
 
     // Determine what to highlight based on the model (shapes or data graph)
     if (this.model === "shapesGraph" && state.highlight.shapesGraphHighlight) {
-      highlightTerm = state.highlight.shapesGraphHighlight;
+      const highlight = state.highlight.shapesGraphHighlight;
+
+      // Check if it's an object with sourceShape and resultPath
+      if (typeof highlight === 'object' && highlight.sourceShape && highlight.resultPath) {
+        highlightTerm = highlight.resultPath;
+        highlightContext = highlight.sourceShape;
+      } else {
+        // Legacy format: just a string (the term to highlight)
+        highlightTerm = highlight;
+      }
     } else if (this.model === "dataGraph" && state.highlight.dataGraphHighlight) {
       const { focusNode, resultPath } = state.highlight.dataGraphHighlight;
       // For data graph, we need to highlight the property in context of the specific subject
@@ -840,6 +1093,7 @@ class GraphEditor extends connect(store, LitElement) {
       quads: state[this.model].quads,
       highlightTerm,
       highlightContext,
+      highlightTimestamp: state.highlight.timestamp, // Include timestamp
     };
   }
 }
