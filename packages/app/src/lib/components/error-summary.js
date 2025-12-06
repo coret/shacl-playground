@@ -1,6 +1,7 @@
-import { html, LitElement } from "lit";
+import { html, LitElement, css } from "lit";
 import { shrink } from "@zazuko/prefixes/shrink";
 import rdf from "../env.js";
+import { store } from "../store/index.js";
 
 function createMessage(result) {
   try {
@@ -26,7 +27,45 @@ function createMessage(result) {
   return "Unspecified error";
 }
 
-const renderResult = (result) => html` <li>${createMessage(result)}</li> `;
+const handleErrorClick = (result) => {
+  // Directly set new highlights without clearing first
+  // This prevents the double-update that causes scroll jumping
+
+  // For shapes graph, use resultPath (the property that violated the constraint)
+  if (result.resultPath) {
+    const resultPathValue = result.resultPath?.id?.value || result.resultPath?.value;
+    store.dispatch.highlight.highlightShapesNode(resultPathValue);
+  } else if (result.sourceConstraintComponent) {
+    // Fallback to constraint component
+    const constraintValue = result.sourceConstraintComponent?.id?.value || result.sourceConstraintComponent?.value;
+    store.dispatch.highlight.highlightShapesNode(constraintValue);
+  }
+
+  // Highlight data graph node if focusNode exists
+  if (result.focusNode) {
+    const focusNodeValue = result.focusNode.value;
+    const resultPathValue = result.resultPath?.id?.value || result.resultPath?.value || null;
+    store.dispatch.highlight.highlightDataNode({
+      focusNode: focusNodeValue,
+      resultPath: resultPathValue,
+    });
+  }
+};
+
+const renderResult = (result) => html`
+  <li>
+    <a
+      href="#"
+      class="error-link"
+      @click="${(e) => {
+        e.preventDefault();
+        handleErrorClick(result);
+      }}"
+    >
+      ${createMessage(result)}
+    </a>
+  </li>
+`;
 
 function renderSummary({ focusNodes, ...top }, customPrefixes) {
   return html`
@@ -82,6 +121,24 @@ function reduceToFocusNodes({ focusNodes, errors }, result) {
 }
 
 class ErrorSummary extends LitElement {
+  static get styles() {
+    return css`
+      .error-link {
+        color: inherit;
+        text-decoration: none;
+        cursor: pointer;
+        display: block;
+        padding: 0.25em;
+        outline: none;
+        border-radius: 0.25em;
+      }
+
+      .error-link:hover {
+        background-color: var(--lumo-primary-color-10pct); // not nice in respect to depencies
+      }
+    `;
+  }
+
   static get properties() {
     return {
       validationResults: { type: Array },
